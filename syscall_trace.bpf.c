@@ -18,7 +18,7 @@ char LICENSE[] SEC("license") = "GPL";
 struct evt {
     __u32 tid;
     __u32 id;
-    __u8  type;   // 0 = enter, 1 = exit
+    __u8  type;   // 0 = enter, 1 = exit, 2=switch_out, 3=switch_in
 };
 
 /**
@@ -70,6 +70,33 @@ int tp_sys_enter(struct trace_event_raw_sys_enter *ctx)
     e->type = 0;
 
     bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
+SEC("tracepoint/sched/sched_switch")
+int tp_sched_switch(struct trace_event_raw_sched_switch *ctx)
+{
+    // ctx->prev_pid  : TID being switched out
+    // ctx->next_pid  : TID being switched in
+
+    // Emit SWITCH_OUT for prev
+    struct evt *e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
+    if (e) {
+        e->tid  = (__u32)ctx->prev_pid;
+        e->id   = 0;
+        e->type = 2; // switch_out
+        bpf_ringbuf_submit(e, 0);
+    }
+
+    // Emit SWITCH_IN for next
+    e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
+    if (e) {
+        e->tid  = (__u32)ctx->next_pid;
+        e->id   = 0;
+        e->type = 3; // switch_in
+        bpf_ringbuf_submit(e, 0);
+    }
+
     return 0;
 }
 

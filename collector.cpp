@@ -28,16 +28,18 @@ static void on_sigint(int) { stop_flag = 1; }
  */
 struct evt {
     uint32_t tid;
-    uint32_t id;
-    uint8_t  type; // 0 enter, 1 exit
+    uint32_t id;   // syscall id for enter/exit, unused for switch
+    uint8_t  type; // 0 enter, 1 exit, 2 switch_out, 3 switch_in
 };
 
 /**
- * Map-Element System Call ID -> Energy
+ * Per-TID inflight state (supports sched_switch gating)
  */
 struct Inflight {
-    uint32_t syscall_id;
-    double   start_energy;
+    uint32_t syscall_id = 0;
+    double   start_energy = 0.0;  // valid only while "running" segment is active
+    bool     in_syscall = false;  // between sys_enter and sys_exit
+    bool     running   = false;   // currently on CPU segment we are measuring
 };
 
 // Maximum id of syscalls we want to profile. Only necessary to allocate enough memory
@@ -49,7 +51,29 @@ static std::vector<double>   energy_per_syscall(MAX_SYSCALL, 0.0);
 static std::vector<uint64_t> count_per_syscall (MAX_SYSCALL, 0);
 
 /**
- * Event handler that will be called if a syscall is being entered or left
+ * Helper: add energy delta for a running segment and stop the segment.
+ * Safe if called only when inf.running==true.
+ */
+static inline void stop_segment_and_accumulate(Inflight& inf) {
+    const double endEng = RaplReader::readEnergy(CPU_DOMAIN);
+    const double dE = endEng - inf.start_energy;
+
+    if (inf.syscall_id < MAX_SYSCALL) {
+        energy_per_syscall[inf.syscall_id] += dE;
+    }
+    inf.running = false;
+}
+
+/**
+ * Helper: start a new running segment (after sys_enter or after switch_in while still in syscall)
+ */
+static inline void start_segment(Inflight& inf) {
+    inf.start_energy = RaplReader::readEnergy(CPU_DOMAIN);
+    inf.running = true;
+}
+
+/**
+ * Event handler that will be called for syscall enter/exit and sched_switch gating
  * @param data Data inserted into the syscall
  * @param data_sz Size of the corresponding data
  * @return Returns 0
@@ -58,27 +82,63 @@ static int handle_event(void*, void* data, size_t data_sz) {
     if (data_sz < sizeof(evt)) return 0;
 
     const auto* e = static_cast<const evt*>(data);
-    if (e->id >= MAX_SYSCALL) return 0;
 
-    if (e->type == 0) { // enter
-        // Record the energy counter upon entering the syscall
-        inflight[e->tid] = Inflight{e->id, RaplReader::readEnergy(CPU_DOMAIN)};
-    } else { // exit
-        // Record the energy counter upon leaving the syscall
-        const double endEng = RaplReader::readEnergy(CPU_DOMAIN);
+    // Ensure we have a state entry for this TID (also for switch events)
+    auto& inf = inflight[e->tid]; // default-constructs if missing
 
-        // Search for the syscall entry
-        auto it = inflight.find(e->tid);
-        if (it == inflight.end()) return 0;
+    switch (e->type) {
+        case 0: { // sys_enter
+            if (e->id >= MAX_SYSCALL) {
+                inf = Inflight{};
+                return 0;
+            }
 
-        const Inflight inf = it->second;
-        inflight.erase(it);
+            inf.syscall_id = e->id;
+            inf.in_syscall = true;
 
-        // Calculate the energy delta
-        const double dE = endEng - inf.start_energy;
-        energy_per_syscall[inf.syscall_id] += dE;
-        count_per_syscall[inf.syscall_id] += 1;
+            // At sys_enter we are on CPU, start measuring immediately
+            start_segment(inf);
+            break;
+        }
+
+        case 2: { // switch_out (prev_tid)
+            // If the thread is switched out while still inside a syscall,
+            // stop measuring so we do not measure sleep time.
+            if (inf.in_syscall && inf.running) {
+                stop_segment_and_accumulate(inf);
+            }
+            break;
+        }
+
+        case 3: { // switch_in (next_tid)
+            // If the thread is scheduled back in and still inside the same syscall,
+            // restart measuring for the next on-CPU segment.
+            if (inf.in_syscall && !inf.running) {
+                start_segment(inf);
+            }
+            break;
+        }
+
+        case 1: { // sys_exit
+            // Finish the last on-CPU segment
+            if (inf.in_syscall && inf.running) {
+                stop_segment_and_accumulate(inf);
+            }
+
+            // Count one syscall completion
+            if (inf.in_syscall && inf.syscall_id < MAX_SYSCALL) {
+                count_per_syscall[inf.syscall_id] += 1;
+            }
+
+            // Clear state for this TID to avoid trash.
+            inflight.erase(e->tid);
+            break;
+        }
+
+        default:
+            break;
     }
+
     return 0;
 }
 
@@ -165,14 +225,12 @@ int main() {
         }
     }
 
-    std::printf("syscall_id,energy,count\n");
+    std::printf("syscall_id,avg_energy_per_call,total_energy,count\n");
     for (uint32_t i = 0; i < MAX_SYSCALL; ++i) {
-        double avg = 0.0;
-        if (count_per_syscall[i] != 0) {
-            avg = energy_per_syscall[i] / static_cast<double>(count_per_syscall[i]);
-            std::printf("%u,%.12f,%lu\n", i, avg, count_per_syscall[i]);
-        }
-
+        if (count_per_syscall[i] == 0) continue;
+        const double total = energy_per_syscall[i];
+        const double avg   = total / static_cast<double>(count_per_syscall[i]);
+        std::printf("%u,%.12f,%.12f,%lu\n", i, avg, total, count_per_syscall[i]);
     }
 
     return 0;
